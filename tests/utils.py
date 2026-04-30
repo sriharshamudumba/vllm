@@ -1303,9 +1303,7 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
 
     @functools.wraps(f)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> None:
-        # Check if we're already in a subprocess
         if os.environ.get("RUNNING_IN_SUBPROCESS") == "1":
-            # If we are, just run the function directly
             return f(*args, **kwargs)
 
         import torch.multiprocessing as mp
@@ -1313,38 +1311,35 @@ def spawn_new_process_for_each_test(f: Callable[_P, None]) -> Callable[_P, None]
         with suppress(RuntimeError):
             mp.set_start_method("spawn")
 
-        # Get the module
-        module_name = f.__module__
-
-        # Create a process with environment variable set
         env = os.environ.copy()
         env["RUNNING_IN_SUBPROCESS"] = "1"
 
-        with tempfile.TemporaryDirectory() as tempdir:
-            output_filepath = os.path.join(tempdir, "new_process.tmp")
+        # args and kwargs are now included so parametrized tests work correctly
+        input_bytes = cloudpickle.dumps((f, args, kwargs))
 
-            # `cloudpickle` allows pickling complex functions directly
-            input_bytes = cloudpickle.dumps((f, output_filepath))
+        repo_root = str(VLLM_PATH.resolve())
+        env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
 
-            repo_root = str(VLLM_PATH.resolve())
+        # switched from `python -m <module>` which only imported the module
+        # and never called f, to `python -c` which reads and executes f
+        cmd = [
+            sys.executable,
+            "-c",
+            "import sys, cloudpickle; "
+            "f, args, kwargs = cloudpickle.loads(sys.stdin.buffer.read()); "
+            "f(*args, **kwargs)",
+        ]
 
-            env = dict(env or os.environ)
-            env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+        returned = subprocess.run(cmd, input=input_bytes, capture_output=True, env=env)
 
-            cmd = [sys.executable, "-m", f"{module_name}"]
-
-            returned = subprocess.run(
-                cmd, input=input_bytes, capture_output=True, env=env
-            )
-
-            # check if the subprocess is successful
-            try:
-                returned.check_returncode()
-            except Exception as e:
-                # wrap raised exception to provide more information
-                raise RuntimeError(
-                    f"Error raised in subprocess:\n{returned.stderr.decode()}"
-                ) from e
+        try:
+            returned.check_returncode()
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Error raised in subprocess:\n"
+                f"STDOUT:\n{returned.stdout.decode(errors='replace')}\n"
+                f"STDERR:\n{returned.stderr.decode(errors='replace')}"
+            ) from e
 
     return wrapper
 
